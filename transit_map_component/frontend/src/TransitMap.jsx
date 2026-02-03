@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { MapContainer, TileLayer, Marker, Polyline, GeoJSON, useMapEvents } from "react-leaflet";
+import { MapContainer, TileLayer, Marker, Polyline, GeoJSON, Tooltip, useMapEvents } from "react-leaflet";
+
 import L from "leaflet";
 import { Streamlit } from "streamlit-component-lib";
 
@@ -40,19 +41,31 @@ function stationsEqual(a, b) {
 }
 
 // Captures clicks + view changes
-function MapEvents({ onMapClick, onViewChange }) {
-    const map = useMapEvents({
+// function MapEvents({ onMapClick, onViewChange }) {
+//     const map = useMapEvents({
+//         click(e) {
+//             onMapClick?.(e.latlng);
+//         },
+//         moveend() {
+//             const c = map.getCenter();
+//             onViewChange?.({ center: [c.lat, c.lng], zoom: map.getZoom() });
+//         },
+//         zoomend() {
+//             const c = map.getCenter();
+//             onViewChange?.({ center: [c.lat, c.lng], zoom: map.getZoom() });
+//         },
+//     });
+//     return null;
+// }
+
+function MapEvents({ onMapClick }) {
+    useMapEvents({
         click(e) {
             onMapClick?.(e.latlng);
         },
-        moveend() {
-            const c = map.getCenter();
-            onViewChange?.({ center: [c.lat, c.lng], zoom: map.getZoom() });
-        },
-        zoomend() {
-            const c = map.getCenter();
-            onViewChange?.({ center: [c.lat, c.lng], zoom: map.getZoom() });
-        },
+        // IMPORTANT: do NOT emit anything on move/zoom
+        moveend() { },
+        zoomend() { },
     });
     return null;
 }
@@ -60,11 +73,13 @@ function MapEvents({ onMapClick, onViewChange }) {
 export default function TransitMap(props) {
     const {
         initialStations = [],
+        stationsVersion = 0,
         initialCenter = [37.7749, -122.4194],
         initialZoom = 12,
         clickToAdd = true,
         geojsonLayers = [],
         height = 650,
+        stationTooltips = [],
     } = props;
 
     // ---- derived initial values from props ----
@@ -81,12 +96,25 @@ export default function TransitMap(props) {
     const [zoom, setZoom] = useState(initZoom);
 
     // ---- refs to avoid stale closures + echo loops ----
+    const lastAppliedStationsVersionRef = useRef(parseInt(stationsVersion, 10) || 0);
+
+    useEffect(() => {
+        const v = parseInt(stationsVersion, 10) || 0;
+        if (v === lastAppliedStationsVersionRef.current) return;
+
+        const incoming = normalizeStations(initialStations);
+        lastAppliedStationsVersionRef.current = v;
+        setStations(incoming);
+    }, [stationsVersion, initialStations]);
+
+
+
     const stationsRef = useRef(stations);
     useEffect(() => {
         stationsRef.current = stations;
     }, [stations]);
 
-    const lastSentStationsRef = useRef(initStations);
+    const lastSentStationsRef = useRef(normalizeStations(initialStations));
 
     // ---- Streamlit ready + sizing ----
     useEffect(() => {
@@ -104,18 +132,9 @@ export default function TransitMap(props) {
             stations: nextStations,
             center: nextCenter,
             zoom: nextZoom,
+            appliedStationsVersion: lastAppliedStationsVersionRef.current,
         });
     }, []);
-
-    // ---- guard against Streamlit rerun echo overwriting local state ----
-    useEffect(() => {
-        const incoming = normalizeStations(initialStations);
-
-        // Only adopt incoming stations if they're not merely an echo of what we just sent.
-        if (!stationsEqual(incoming, lastSentStationsRef.current) && !stationsEqual(incoming, stations)) {
-            setStations(incoming);
-        }
-    }, [initialStations, stations]);
 
     // Center/zoom can safely follow props (they don't affect station list logic)
     useEffect(() => {
@@ -191,8 +210,19 @@ export default function TransitMap(props) {
 
     const layers = useMemo(() => {
         if (!Array.isArray(geojsonLayers)) return [];
-        return geojsonLayers.filter((l) => l && l.geojson && l.geojson.features && l.geojson.features.length > 0);
+
+        return geojsonLayers.filter((l) => {
+            const g = l?.geojson;
+            if (!g || typeof g !== "object") return false;
+
+            // Accept FeatureCollection / Feature / Geometry objects
+            if (g.type === "FeatureCollection") return Array.isArray(g.features) && g.features.length > 0;
+            if (g.type === "Feature") return true;
+            if (typeof g.type === "string") return true; // Geometry (Polygon, MultiPolygon, etc.)
+            return false;
+        });
     }, [geojsonLayers]);
+
 
     return (
         <div style={{ width: "100%", height: height || 650 }}>
@@ -202,30 +232,38 @@ export default function TransitMap(props) {
                     url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
                 />
 
-                <MapEvents onMapClick={onMapClick} onViewChange={onViewChange} />
+                {/* <MapEvents onMapClick={onMapClick} onViewChange={onViewChange} /> */}
+                <MapEvents onMapClick={onMapClick} />
 
                 {layers.map((l, i) => (
                     <GeoJSON
                         key={`${l.name || "layer"}-${i}`}
                         data={l.geojson}
                         style={() => ({
-                            color: (l.style && l.style.color) || "#3388ff",
-                            weight: (l.style && l.style.weight) || 2,
+                            color: (l.style && l.style.color) || "#3388ff",                 // stroke
+                            weight: (l.style && l.style.weight) ?? 2,
+                            opacity: (l.style && l.style.opacity) ?? 1.0,                  // stroke opacity
+                            fillColor: (l.style && (l.style.fillColor || l.style.color)) || "#3388ff",
                             fillOpacity: (l.style && l.style.fillOpacity) ?? 0.12,
+                            dashArray: (l.style && l.style.dashArray) || null,             // optional
                         })}
                     />
                 ))}
 
                 {stations.map(([lat, lon], idx) => (
                     <Marker
-                        key={`st-${idx}`}
+                        key={`st-${lat.toFixed(6)}-${lon.toFixed(6)}-${idx}`}
                         position={[lat, lon]}
                         draggable={true}
                         eventHandlers={{
                             dragend: (e) => onMarkerDragEnd(idx, e),
                             contextmenu: () => onMarkerRightClick(idx),
                         }}
-                    />
+                    >
+                        <Tooltip direction="top" sticky>
+                            {stationTooltips[idx] ?? `Station ${idx + 1}`}
+                        </Tooltip>
+                    </Marker>
                 ))}
 
                 {stations.length >= 2 && (

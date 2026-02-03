@@ -23,11 +23,13 @@ else:
 def transit_map(
     *,
     stations: List[Tuple[float, float]],
+    stations_version: int = 0,
     center: Tuple[float, float],
     zoom: int,
     click_to_add: bool,
     geojson_layers: Optional[List[Dict[str, Any]]] = None,
     height: int = 650,
+    station_tooltips=None,   # <-- ADD (python-style)
     key: str = "transit_map",
 ) -> Dict[str, Any]:
     """
@@ -38,11 +40,13 @@ def transit_map(
     """
     res = _component(
         initialStations=[list(x) for x in stations],
+        stationsVersion=int(stations_version),
         initialCenter=[float(center[0]), float(center[1])],
         initialZoom=int(zoom),
         clickToAdd=bool(click_to_add),
         geojsonLayers=geojson_layers or [],
         height=int(height),
+        stationTooltips=station_tooltips or [],  # <-- FORWARD (JS-style camelCase)
         key=key,
         default={"stations": [list(x) for x in stations], "center": list(center), "zoom": int(zoom)},
     )

@@ -55,8 +55,38 @@ from transit_map_component import transit_map
 # Config
 # ----------------------------
 
+st.set_page_config(
+    page_title="Transit Line Estimation Tool",
+    layout="wide",
+)
+
 st.markdown(
     """
+    <style>
+      /* Pull main content up (removes dead space above first element) */
+      [data-testid="stAppViewContainer"] .main .block-container{
+          padding-top: 0.4rem !important;
+          padding-bottom: 0.4rem !important;
+      }
+
+      /* Also remove the extra padding Streamlit sometimes adds around the main section */
+      section.main > div {
+          padding-top: 0rem !important;
+      }
+
+      /* Tighten the first title spacing */
+      h1 {
+          margin-top: 0rem;
+          padding-top: 0rem;
+          margin-bottom: 0.25rem;
+      }
+
+      /* Optional: slightly reduce space between elements globally */
+      .stMarkdown, .stText, .stCaption {
+          margin-top: 0rem;
+      }
+    </style>
+
     <style>
     /* --- Make metric labels wrap (no ellipsis) --- */
     div[data-testid="stMetricLabel"] * {
@@ -84,11 +114,6 @@ st.markdown(
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = Path(os.environ.get("TRANSITTOOL_DATA_DIR", REPO_ROOT / "data" / "transit_tool")).expanduser()
 
-st.set_page_config(
-    page_title="Transit Line Sketch Tool",
-    layout="wide",
-)
-
 DEFAULT_CENTER = (37.7749, -122.4194)  # (lat, lon) SF-ish; change for your region
 DEFAULT_ZOOM = 12
 
@@ -96,6 +121,96 @@ DEFAULT_ZOOM = 12
 # ----------------------------
 # Helpers: station storage / parsing
 # ----------------------------
+
+def _ramp_red_yellow_green(t: float) -> str:
+    """
+    t in [0,1]
+    0.00 -> deep red
+    0.35 -> orange
+    0.65 -> yellow
+    1.00 -> green
+    """
+    t = max(0.0, min(1.0, float(t)))
+
+    if t <= 0.35:
+        # red -> orange
+        a = t / 0.35
+        r = 255
+        g = int(60 + a * (165 - 60))   # 60 -> 165
+        b = 0
+
+    elif t <= 0.65:
+        # orange -> yellow
+        a = (t - 0.35) / (0.65 - 0.35)
+        r = 255
+        g = int(165 + a * (255 - 165)) # 165 -> 255
+        b = 0
+
+    else:
+        # yellow -> green
+        a = (t - 0.65) / (1.0 - 0.65)
+        r = int(255 - a * 255)         # 255 -> 0
+        g = 255
+        b = 0
+
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+def _opacity_ramp_centered(
+    t: float,
+    *,
+    max_opacity: float,
+    min_opacity: float,
+    gamma: float = 1.6,
+) -> float:
+    """
+    Opacity decay from center outward.
+
+    t in [0,1]
+    gamma > 1 biases opacity toward the center
+    """
+    t = max(0.0, min(1.0, float(t)))
+
+    # invert so 1.0 = center, 0.0 = edge
+    w = 1.0 - t
+
+    # nonlinear falloff (gamma controls steepness)
+    w = w ** gamma
+
+    return min_opacity + w * (max_opacity - min_opacity)
+
+def _pick_threshold_layer(layer_dict: dict, thresholds_min: list[int]) -> dict:
+    """Pick the max-threshold GeoJSON layer regardless of key type (str/int/float)."""
+    if not layer_dict:
+        return {}
+    tmax = max(thresholds_min)
+    return (
+        layer_dict.get(str(tmax))
+        or layer_dict.get(int(tmax))
+        or layer_dict.get(float(tmax))
+        or {}
+    )
+
+def _as_featurecollection(g: object) -> dict:
+    """Coerce various GeoJSON-ish shapes into a FeatureCollection for Leaflet."""
+    if not isinstance(g, dict):
+        return {"type": "FeatureCollection", "features": []}
+
+    t = g.get("type")
+    if t == "FeatureCollection" and isinstance(g.get("features"), list):
+        return g
+
+    if t == "Feature":
+        return {"type": "FeatureCollection", "features": [g]}
+
+    # Geometry object
+    if isinstance(t, str) and t in {
+        "Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon", "GeometryCollection"
+    }:
+        return {"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {}, "geometry": g}]}
+
+    # Unknown dict shape → treat as empty
+    return {"type": "FeatureCollection", "features": []}
+
 
 def _haversine_miles(lat1, lon1, lat2, lon2) -> float:
     # Earth radius in miles
@@ -119,6 +234,12 @@ def _ensure_session_state():
         st.session_state.last_metrics = None
     if "last_drawn_point" not in st.session_state:
         st.session_state.last_drawn_point = None  # (lat, lon) last appended from draw tool
+    if "stations_version" not in st.session_state:
+        st.session_state.stations_version = 0
+
+def _bump_stations_version() -> None:
+    """Force the React map component to accept the Python-side station list."""
+    st.session_state.stations_version = int(st.session_state.get("stations_version", 0)) + 1
 
 
 def _latlon_to_lonlat_array(stations_latlon: List[Tuple[float, float]]) -> np.ndarray:
@@ -438,7 +559,7 @@ def get_assets_cached(graph_path: str, bg_path: str, od_path: str):
 def main():
     _ensure_session_state()
 
-    st.title("Transit Line Sketch Tool")
+    st.title("Transit Line Estimation Tool")
     st.caption("Click to add stations in order. Use the draw toolbar to edit/move/delete markers. Click compute to update metrics.")
 
     graph_path, bg_path, od_path, params = _sidebar_inputs()
@@ -507,29 +628,78 @@ def main():
         # Build GeoJSON layers list in the format the component expects
         geo_layers = []
         if st.session_state.last_metrics and "layers" in st.session_state.last_metrics:
-            layers = st.session_state.last_metrics["layers"].get("catchments", {})
-            try:
-                walk = layers.get("walk", {})
-                bike = layers.get("bike", {})
-                if walk:
-                    tmax = str(max(params.walk_thresholds_min))
-                    geo_layers.append({
-                        "name": f"Walk catchments ≤ {tmax} min",
-                        "geojson": walk.get(tmax, {}),
-                        "style": {"weight": 2, "fillOpacity": 0.12},
-                    })
-                if bike:
-                    tmax = str(max(params.bike_thresholds_min))
-                    geo_layers.append({
-                        "name": f"Bike catchments ≤ {tmax} min",
-                        "geojson": bike.get(tmax, {}),
-                        "style": {"weight": 2, "fillOpacity": 0.12},
-                    })
-            except Exception:
-                pass
+            catch = st.session_state.last_metrics["layers"].get("catchments", {})
+            walk = catch.get("walk", {}) if isinstance(catch, dict) else {}
+            bike = catch.get("bike", {}) if isinstance(catch, dict) else {}
+
+            # --- WALK rings ---
+            w_th = sorted(params.walk_thresholds_min)
+            w_min, w_max = w_th[0], w_th[-1]
+            for tmin in w_th:
+                g = _as_featurecollection(_pick_threshold_layer(walk, [tmin]))
+                if not g["features"]:
+                    continue
+
+                frac = 0.0 if w_max == w_min else (tmin - w_min) / (w_max - w_min)
+                fill = _ramp_red_yellow_green(frac)
+
+                # Only the OUTERMOST ring gets a strong red outline
+                is_outer = (tmin == w_max)
+
+                opacity = _opacity_ramp_centered(
+                    frac,
+                    max_opacity=0.35,   # center
+                    min_opacity=0.15,   # outer edge
+                    gamma=1.8,
+                )
+
+                geo_layers.append({
+                    "name": f"Walk ≤ {tmin} min",
+                    "geojson": g,
+                    "style": {
+                        "fillColor": fill,
+                        "fillOpacity": opacity,                 # tune
+                        "color": "#b71c1c" if is_outer else "#000000",
+                        "opacity": 1.0 if is_outer else 0.0, # hide interior outlines
+                        "weight": 2 if is_outer else 0,
+                    },
+                })
+
+            # --- BIKE rings ---
+            b_th = sorted(params.bike_thresholds_min)
+            b_min, b_max = b_th[0], b_th[-1]
+            for tmin in b_th:
+                g = _as_featurecollection(_pick_threshold_layer(bike, [tmin]))
+                if not g["features"]:
+                    continue
+
+                frac = 0.0 if b_max == b_min else (tmin - b_min) / (b_max - b_min)
+                fill = _ramp_red_yellow_green(frac)
+
+                opacity = _opacity_ramp_centered(
+                    frac,
+                    max_opacity=0.15,
+                    min_opacity=0.05,
+                    gamma=1.4,
+                )
+
+                geo_layers.append({
+                    "name": f"Bike ≤ {tmin} min",
+                    "geojson": g,
+                    "style": {
+                        "fillColor": fill,
+                        "fillOpacity": opacity,    # << bike more transparent
+                        "color": "#1b5e20",
+                        "opacity": 0.25,
+                        "weight": 0,
+                        "dashArray": "3 6",     # optional: make bike visually distinct
+                    },
+                })
 
         # Keep your existing UX toggle
         click_add = st.checkbox("Click map to add station", value=True, key="click_add_station")
+
+        station_tooltips = [f"Station {i+1}" for i in range(len(st.session_state.stations_latlon))]
 
         # Render the React map (NO folium; NO iframe reload per rerun)
         map_state = transit_map(
@@ -539,11 +709,46 @@ def main():
             click_to_add=click_add,
             geojson_layers=geo_layers,
             height=650,
+            station_tooltips=station_tooltips,   # <-- add this
+            stations_version=int(st.session_state.stations_version),
             key="main_map_react",
         )
 
+        # --- Buttons directly under the map ---
+        btn1, btn2, btn3 = st.columns(3)
+
+        with btn1:
+            if st.button("Clear All Stations", key="btn_clear_stations"):
+                st.session_state.stations_latlon = []
+                st.session_state.last_metrics = None
+                _bump_stations_version()
+                st.rerun()
+
+        with btn2:
+            if st.button("Remove Last Station", key="btn_remove_last") and st.session_state.stations_latlon:
+                st.session_state.stations_latlon.pop()
+                st.session_state.last_metrics = None
+                _bump_stations_version()
+                st.rerun()
+
+        with btn3:
+            if st.button("Reverse Station Order", key="btn_reverse") and len(st.session_state.stations_latlon) >= 2:
+                st.session_state.stations_latlon = list(reversed(st.session_state.stations_latlon))
+                st.session_state.last_metrics = None
+                _bump_stations_version()
+                st.rerun()
+
+        st.divider()
+
         # ---- Sync React map -> Streamlit session state ----
         prev_stations = list(st.session_state.get("stations_latlon", []))
+
+        applied_v = (map_state or {}).get("appliedStationsVersion", None)
+        expected_v = int(st.session_state.stations_version)
+
+        # Only trust the component's stations if the frontend says it has applied
+        # the current Python stations_version.
+        trust_stations = (applied_v is not None) and (int(applied_v) == expected_v)
 
         raw = (map_state or {}).get("stations") or []
         new_stations = []
@@ -555,18 +760,26 @@ def main():
             except Exception:
                 pass
 
-        # Only update if changed (prevents unnecessary invalidations)
-        if new_stations != prev_stations:
-            st.session_state.stations_latlon = new_stations
-            st.session_state.last_metrics = None  # match your current behavior: edits invalidate results
+        if trust_stations:
+            if new_stations != prev_stations:
+                st.session_state.stations_latlon = new_stations
+
+                had_metrics = st.session_state.last_metrics is not None
+                st.session_state.last_metrics = None
+
+                if had_metrics:
+                    st.rerun()  # <-- IMPORTANT: re-render map with geo_layers cleared
+        else:
+            # Still allow view updates even when we don't trust stations yet
+            pass
 
         # Persist view (optional)
-        c = (map_state or {}).get("center")
-        z = (map_state or {}).get("zoom")
-        if c and len(c) == 2:
-            st.session_state.map_center = (float(c[0]), float(c[1]))
-        if z is not None:
-            st.session_state.map_zoom = int(z)
+        # c = (map_state or {}).get("center")
+        # z = (map_state or {}).get("zoom")
+        # if c and len(c) == 2:
+        #     st.session_state.map_center = (float(c[0]), float(c[1]))
+        # if z is not None:
+        #     st.session_state.map_zoom = int(z)
         # -----------------------------------------------
 
         # Station list editor
@@ -592,12 +805,14 @@ def main():
                     if st.button("↑", key=f"up_{i}", disabled=up_disabled):
                         stations[i-1], stations[i] = stations[i], stations[i-1]
                         st.session_state.last_metrics = None
+                        _bump_stations_version()
                         st.rerun()
                 with c4:
                     down_disabled = (i == len(stations)-1)
                     if st.button("↓", key=f"down_{i}", disabled=down_disabled):
                         stations[i+1], stations[i] = stations[i], stations[i+1]
                         st.session_state.last_metrics = None
+                        _bump_stations_version()
                         st.rerun()
 
             # Optional: infill insert
@@ -608,26 +823,30 @@ def main():
             if st.button("Insert station"):
                 stations.insert(int(ins_idx)-1, (float(ins_lat), float(ins_lon)))
                 st.session_state.last_metrics = None
+                _bump_stations_version()
                 st.rerun()
         else:
             st.info("No stations yet. Click on the map to add stations (or use the marker draw tool).")
 
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            if st.button("Clear stations"):
-                st.session_state.stations_latlon = []
-                st.session_state.last_metrics = None
-                st.rerun()
-        with col_b:
-            if st.button("Remove last station") and st.session_state.stations_latlon:
-                st.session_state.stations_latlon.pop()
-                st.session_state.last_metrics = None
-                st.rerun()
-        with col_c:
-            if st.button("Reverse order") and len(st.session_state.stations_latlon) >= 2:
-                st.session_state.stations_latlon = list(reversed(st.session_state.stations_latlon))
-                st.session_state.last_metrics = None
-                st.rerun()
+        # col_a, col_b, col_c = st.columns(3)
+        # with col_a:
+        #     if st.button("Clear stations"):
+        #         st.session_state.stations_latlon = []
+        #         st.session_state.last_metrics = None
+        #         _bump_stations_version()
+        #         st.rerun()
+        # with col_b:
+        #     if st.button("Remove last station") and st.session_state.stations_latlon:
+        #         st.session_state.stations_latlon.pop()
+        #         st.session_state.last_metrics = None
+        #         _bump_stations_version()
+        #         st.rerun()
+        # with col_c:
+        #     if st.button("Reverse order") and len(st.session_state.stations_latlon) >= 2:
+        #         st.session_state.stations_latlon = list(reversed(st.session_state.stations_latlon))
+        #         st.session_state.last_metrics = None
+        #         _bump_stations_version()
+        #         st.rerun()
 
     with right:
         st.subheader("Compute")
@@ -642,6 +861,7 @@ def main():
                     out = compute_line_metrics(assets, station_lonlat, params)
                 st.session_state.last_metrics = out
                 st.success("Done.")
+                st.rerun()
             except Exception as e:
                 st.error("Computation failed.")
                 st.exception(e)
