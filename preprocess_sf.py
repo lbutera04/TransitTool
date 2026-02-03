@@ -113,7 +113,7 @@ def bg_id_colname(gdf: gpd.GeoDataFrame) -> str:
 
 
 def pop_colname(gdf: gpd.GeoDataFrame) -> Optional[str]:
-    return choose_col(gdf, ["population", "POP", "pop", "totpop", "P0010001", "TOTAL_POP"])
+    return choose_col(gdf, ["POPULATION", "population", "POP", "pop", "totpop", "P0010001", "TOTAL_POP"])
 
 
 def parse_bbox_sf(bg_gdf: gpd.GeoDataFrame) -> Tuple[float, float, float, float]:
@@ -429,8 +429,8 @@ def clean_replica_od(
         return None
 
     # Candidate columns for trip-level file
-    o_trip = choose_col(od, ["origin_bgrp_2020", "origin_bg", "origin_geoid", "origin"])
-    d_trip = choose_col(od, ["destination_bgrp_2020", "destination_bg", "destination_geoid", "destination"])
+    o_trip = choose_col(od, ["origin_bgrp_fips_2020", "origin_bg", "origin_geoid", "origin"])
+    d_trip = choose_col(od, ["destination_bgrp_fips_2020", "destination_bg", "destination_geoid", "destination"])
     mode_col = choose_col(od, ["primary_mode", "mode", "trip_mode"])
     dist_mi_col = choose_col(od, ["trip_distance_miles", "distance_miles", "dist_miles"])
 

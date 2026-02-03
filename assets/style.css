@@ -1,0 +1,113 @@
+:root {
+    --sidebar-w: 360px;
+    /* <-- set this to match SIDEBAR_W */
+    --card-bg: white;
+    --card-border: 1px solid rgba(0, 0, 0, 0.10);
+    --card-radius: 14px;
+    --card-pad: 14px;
+    --card-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    background: #f6f7f9;
+}
+
+.app-shell {
+    display: flex;
+    height: 100vh;
+}
+
+.sidebar {
+    width: var(--sidebar-w);
+    padding: 14px 14px 18px;
+    overflow-y: auto;
+    background: white;
+    border-right: 1px solid rgba(0, 0, 0, 0.10);
+}
+
+.main {
+    flex: 1;
+    padding: 14px;
+    overflow-y: auto;
+}
+
+.row {
+    display: flex;
+    gap: 14px;
+    align-items: stretch;
+}
+
+.col-left {
+    flex: 1.2;
+    min-width: 520px;
+}
+
+.col-right {
+    flex: 1.0;
+    min-width: 380px;
+}
+
+.section-title {
+    font-weight: 800;
+    font-size: 1.55rem;
+    margin: 0 0 6px;
+}
+
+.caption {
+    margin: 0 0 12px;
+    opacity: 0.72;
+}
+
+.subheader {
+    font-weight: 800;
+    font-size: 1.15rem;
+    margin: 0 0 10px;
+}
+
+.label {
+    font-size: 0.85rem;
+    opacity: 0.85;
+    margin-bottom: 6px;
+}
+
+.input {
+    width: 100%;
+}
+
+.btn {
+    border: 1px solid rgba(0, 0, 0, 0.18);
+    background: white;
+    padding: 8px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.btn-primary {
+    background: #1f77ff;
+    color: white;
+    border: 1px solid #1f77ff;
+    font-weight: 700;
+}
+
+.btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.pill {
+    display: inline-block;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.05);
+    font-size: 0.8rem;
+}
+
+.card {
+    background: var(--card-bg);
+    border: var(--card-border);
+    border-radius: var(--card-radius);
+    padding: var(--card-pad);
+    box-shadow: var(--card-shadow);
+}

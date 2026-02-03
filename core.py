@@ -144,6 +144,20 @@ class ScenarioParams:
     # Performance
     dijkstra_heap_reserve: int = 0  # no-op (kept for tuning hooks)
 
+    # Access/egress behavior model
+    beta_walk_per_min: float = 0.05   # exp(-beta * minutes)
+    beta_bike_per_min: float = 0.14   # harsher than walk
+    bike_base_multiplier: float = 0.45  # overall downweight of bike+transit relative to walk+transit
+
+    # “bike–ride–bike is silly if rail leg is tiny” penalty
+    brb_ratio_floor: float = 0.70     # need in-vehicle >= 0.70 * (access+egress) to avoid big penalty
+    brb_ratio_power: float = 3.0      # higher = harsher penalty when ratio is small
+
+    # Competition with direct biking
+    direct_bike_kmh: float = 13.0
+    bike_comp_scale_min: float = 10.0   # softness of logistic transition (minutes)
+    bike_comp_bias_min: float = 1.0    # positive makes biking “more attractive” vs transit
+
 
 # ----------------------------
 # Loaders (YOU WILL EDIT THESE)
@@ -236,6 +250,69 @@ def load_assets(
 # ----------------------------
 # Core algorithms
 # ----------------------------
+
+def min_dist_map_to_stations(
+    graph: GraphCSR,
+    station_nodes: np.ndarray,
+    mode: Literal["walk", "bike"],
+    cutoff_min: float,
+) -> Dict[int, float]:
+    """
+    Returns dict: node -> min time-to-any-station within cutoff.
+    Only includes nodes reached within cutoff, so memory stays bounded.
+    """
+    w = graph.w_walk_min if mode == "walk" else graph.w_bike_min
+    best: Dict[int, float] = {}
+    for s in station_nodes:
+        nodes, dists = dijkstra_cutoff_csr(graph.indptr, graph.indices, w, int(s), float(cutoff_min))
+        # dists aligned with nodes
+        for n, d in zip(nodes, dists):
+            n = int(n)
+            d = float(d)
+            prev = best.get(n)
+            if prev is None or d < prev:
+                best[n] = d
+    return best
+
+
+def compute_bg_access_alpha_and_time(
+    bgs: BlockGroups,
+    node2dist: Dict[int, float],
+    cutoff_min: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    For each BG:
+      alpha[i] = sum weights of bg_nodes with dist<=cutoff
+      t_mean[i] = weighted mean dist among covered nodes (NaN if alpha=0)
+    """
+    B = len(bgs.bg_ids)
+    alpha = np.zeros(B, dtype=np.float64)
+    tmean = np.full(B, np.nan, dtype=np.float64)
+
+    indptr = bgs.bg_indptr
+    nodes = bgs.bg_nodes
+    wts = bgs.bg_weights
+
+    for i in range(B):
+        a = 0.0
+        td = 0.0
+        for p in range(indptr[i], indptr[i + 1]):
+            n = int(nodes[p])
+            wt = float(wts[p])
+            d = node2dist.get(n)
+            if d is not None and d <= cutoff_min:
+                a += wt
+                td += wt * float(d)
+
+        if a > 0:
+            alpha[i] = a
+            tmean[i] = td / a
+        else:
+            alpha[i] = 0.0
+
+    # clamp for safety
+    np.clip(alpha, 0.0, 1.0, out=alpha)
+    return alpha, tmean
 
 def snap_points_to_nodes_xy(
     kdtree: cKDTree,
@@ -592,6 +669,28 @@ def compute_line_metrics(
     covered_nodes = union_node_sets([unioned["walk"][t_walk_max], unioned["bike"][t_bike_max]])
     alpha = compute_bg_access_fractions(bgs, covered_nodes)  # shape (B,)
 
+    # --- NEW: compute separate walk/bike access factors for ridership (not unioned) ---
+    walk_node2dist = min_dist_map_to_stations(graph, station_nodes, "walk", t_walk_max)
+    bike_node2dist = min_dist_map_to_stations(graph, station_nodes, "bike", t_bike_max)
+
+    alpha_walk, t_walk = compute_bg_access_alpha_and_time(bgs, walk_node2dist, t_walk_max)
+    alpha_bike, t_bike = compute_bg_access_alpha_and_time(bgs, bike_node2dist, t_bike_max)
+
+    # Access/egress factors per BG (minutes-based decay)
+    walk_factor = alpha_walk * np.exp(-params.beta_walk_per_min * np.nan_to_num(t_walk, nan=1e9))
+
+    bike_factor = (
+        params.bike_base_multiplier
+        * alpha_bike
+        * np.exp(-params.beta_bike_per_min * np.nan_to_num(t_bike, nan=1e9))
+    )
+
+    # Combined “effective” access factor used for ridership
+    A = walk_factor + bike_factor  # shape (B,)
+
+    # Bike dominance share (0..1), used to intensify bike–ride–bike penalty
+    bike_dom = np.divide(bike_factor, A, out=np.zeros_like(A), where=(A > 0))
+
     # Accessibility totals (population served within each threshold, unioned across stations)
     pop = bgs.pop.astype(np.float64, copy=False)
 
@@ -623,11 +722,23 @@ def compute_line_metrics(
     o_i = o_idx[mask_known].astype(int).to_numpy()
     d_i = d_idx[mask_known].astype(int).to_numpy()
 
+    CARLIKE = {
+        "car",
+        "private_auto",
+        "auto_driver",
+        "auto_passenger",
+        "rideshare",
+        "taxi",
+    }
+
     # Optional mode filter
+
     if params.restrict_to_primary_mode is not None:
-        od2 = od2[od2["primary_mode"].str.lower() == str(params.restrict_to_primary_mode).lower()]
-        # align indices
-        keep = od2.index.to_numpy()
+        m = str(params.restrict_to_primary_mode).lower()
+        if m == "car":
+            od2 = od2[od2["primary_mode"].str.lower().isin(CARLIKE)]
+        else:
+            od2 = od2[od2["primary_mode"].str.lower() == m]
         # Rebuild o_i/d_i aligned to od2
         # (cheap approach: remap from original using keep mask)
         # We'll just rebuild from scratch:
@@ -639,16 +750,67 @@ def compute_line_metrics(
 
     w_d = compute_distance_weight(dist_km, params).astype(np.float64)
 
-    share = alpha[o_i].astype(np.float64) * alpha[d_i].astype(np.float64) * w_d
-    riders = trips * share
-    total_riders = float(np.sum(riders))
+    # Combined access on each end (walk + downweighted bike)
+    Ao = A[o_i].astype(np.float64)
+    Ad = A[d_i].astype(np.float64)
 
-    # Station-level boardings/alightings (linked trips):
-    # - boardings at origin station
-    # - alightings at destination station
-    # If you want "unlinked boardings", you could count 1 boarding per trip (same as linked here).
+    # Station indices for each OD (needed for in-vehicle time)
     o_station = bg_station[o_i]
     d_station = bg_station[d_i]
+
+    # In-vehicle time proxy from station order distances
+    cumdist = station_line_cumdist_km(snapped_xy)
+    o_st = np.clip(o_station, 0, K - 1)
+    d_st = np.clip(d_station, 0, K - 1)
+    t_iv = line_in_vehicle_time_min(cumdist, o_st, d_st, params.cruise_kmh, params.dwell_sec).astype(np.float64)
+
+    # Expected access+egress time (blend walk/bike by their factor weights)
+    t_walk_o = np.nan_to_num(t_walk[o_i], nan=1e9)
+    t_bike_o = np.nan_to_num(t_bike[o_i], nan=1e9)
+    t_walk_d = np.nan_to_num(t_walk[d_i], nan=1e9)
+    t_bike_d = np.nan_to_num(t_bike[d_i], nan=1e9)
+
+    wf_o = walk_factor[o_i].astype(np.float64)
+    bf_o = bike_factor[o_i].astype(np.float64)
+    wf_d = walk_factor[d_i].astype(np.float64)
+    bf_d = bike_factor[d_i].astype(np.float64)
+
+    to = np.divide(
+        wf_o * t_walk_o + bf_o * t_bike_o,
+        wf_o + bf_o,
+        out=np.full_like(t_walk_o, 1e9, dtype=np.float64),
+        where=((wf_o + bf_o) > 0),
+    )
+    td = np.divide(
+        wf_d * t_walk_d + bf_d * t_bike_d,
+        wf_d + bf_d,
+        out=np.full_like(t_walk_d, 1e9, dtype=np.float64),
+        where=((wf_d + bf_d) > 0),
+    )
+
+    t_access = to + td  # minutes
+
+    # --- Penalty 1: bike–ride–bike stupidity penalty (only when both ends are bike-dominant) ---
+    bike_dom_o = bike_dom[o_i].astype(np.float64)
+    bike_dom_d = bike_dom[d_i].astype(np.float64)
+    both_bikeish = bike_dom_o * bike_dom_d  # 0..1 intensity
+
+    ratio = np.divide(t_iv, t_access, out=np.zeros_like(t_iv), where=(t_access > 0))
+    brb = np.ones_like(t_iv)
+    mask = ratio < params.brb_ratio_floor
+    brb[mask] = (np.maximum(ratio[mask], 1e-6) / params.brb_ratio_floor) ** params.brb_ratio_power
+    brb = (1.0 - both_bikeish) + both_bikeish * brb
+
+    # --- Penalty 2: compete with direct biking ---
+    t_bike_direct = (dist_km.astype(np.float64) / params.direct_bike_kmh) * 60.0
+    t_transit = t_access + t_iv
+
+    z = (t_bike_direct - t_transit - params.bike_comp_bias_min) / params.bike_comp_scale_min
+    p_choose_transit = 1.0 / (1.0 + np.exp(-z))
+
+    share = Ao * Ad * w_d * brb * p_choose_transit
+    riders = trips * share
+    total_riders = float(np.sum(riders))
 
     boardings = np.zeros(K, dtype=np.float64)
     alightings = np.zeros(K, dtype=np.float64)
@@ -665,6 +827,10 @@ def compute_line_metrics(
         "alpha_p90": float(np.quantile(alpha, 0.90)),
         "w_d_mean": float(np.mean(w_d)) if len(w_d) else 0.0,
         "od_rows_used": int(len(od2)),
+        "A_mean": float(np.mean(A)),
+        "walk_factor_mean": float(np.mean(walk_factor)),
+        "bike_factor_mean": float(np.mean(bike_factor)),
+        "bike_dom_mean": float(np.mean(bike_dom)),
     }
 
     # In-vehicle time diagnostics (based on station order distance)
